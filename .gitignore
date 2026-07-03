@@ -1,0 +1,15 @@
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+
+# 혹시라도 실수로 자격증명/키를 두는 것을 방지 (커밋 차단)
+*.key
+*authkey*
+.credentials.json
+.env
+.env.*
+secrets*

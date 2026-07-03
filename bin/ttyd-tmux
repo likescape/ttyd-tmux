@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+#
+# ttyd-tmux — 서버의 "작업 공간(tmux 세션)"을 웹브라우저로 열어주는 도구.
+#
+# 아주 쉽게:
+#   - 작업 공간(tmux 세션) = 서버에서 계속 켜져 있는 화면. 창을 닫아도 안 꺼집니다.
+#   - 이 도구는 그 작업 공간을 "웹 주소"로 열어줍니다. 폰/PC 브라우저로 들어가면 됩니다.
+#   - 작업 공간 안에서 무엇을 돌릴지는 자유입니다(그냥 셸, 프로그램 실행 등).
+#   - 웹으로 들어가도 새로 만드는 게 아니라 '이미 있는 작업 공간에 들어가는' 것뿐입니다.
+#     그래서 브라우저를 닫아도 하던 일은 그대로 남아 있습니다.
+#
+# 보통은 백그라운드로 켜두므로(=up 명령), 이 명령이 화면을 붙잡고 있지 않습니다.
+#
+set -euo pipefail
+
+NET_NAME="${TTYD_TMUX_IFACE:-tailscale0}"   # 웹을 열 네트워크(Tailscale 전용 = 인터넷에 노출 안 됨)
+CONF_DIR="/etc/ttyd-tmux.d"                 # 작업 공간별 설정이 저장되는 곳
+unit() { echo "ttyd-tmux@$1.service"; }
+
+oops() { printf '\033[1;31m✖ %s\033[0m\n' "$*" >&2; }
+say()  { printf '\033[1;36m▶ %s\033[0m\n' "$*"; }
+is_number() { case "$1" in ''|*[!0-9]*) oops "번호(포트)는 숫자여야 합니다: $1"; exit 1;; esac; }
+my_ip() { tailscale ip -4 2>/dev/null | head -1; }
+
+usage() {
+  cat <<'HELP'
+ttyd-tmux — 서버의 작업 공간을 웹브라우저로 열어주는 도구.
+
+쓰는 법:
+  ttyd-tmux up   <이름> <번호> [실행할 것...]  웹으로 열기 (백그라운드, 재부팅해도 유지)
+  ttyd-tmux down <이름>                        웹 창과 작업 공간을 함께 정리(삭제)
+  ttyd-tmux stop <이름>                        웹 창만 잠깐 닫기(작업 공간은 그대로 둠)
+  ttyd-tmux ls                                 지금 열려 있는 목록 보기
+  ttyd-tmux url  <이름>                         접속 주소 보여주기
+  ttyd-tmux run  <이름> <번호> [실행할 것...]  (테스트용) 이 화면에서 바로 열기
+
+  · <이름> : 작업 공간에 붙일 별명 (예: 일감1, work)
+  · <번호> : 접속에 쓸 포트 번호 (작업 공간마다 다르게. 예: 9090, 9091)
+  · [실행할 것] : 작업 공간을 새로 만들 때 안에서 실행할 명령. 안 적으면 그냥 셸.
+
+예:
+  ttyd-tmux up 일감1 9090            작업 공간 '일감1' 을 9090 번으로 열기(셸)
+  ttyd-tmux up 모니터 9091 htop      작업 공간 '모니터' 를 열고 htop 실행
+  ttyd-tmux ls
+  ttyd-tmux down 일감1
+HELP
+  exit "${1:-1}"
+}
+
+action="${1:-}"; [ $# -gt 0 ] && shift || true
+
+case "$action" in
+  up)
+    NAME="${1:-}"; PORT="${2:-}"; [ -n "$NAME" ] && [ -n "$PORT" ] || usage
+    is_number "$PORT"; shift 2 || true
+    RUN_THIS="$*"   # 작업 공간을 새로 만들 때 안에서 실행할 명령(없으면 셸)
+    sudo mkdir -p "$CONF_DIR"
+    # 설정 파일 쓰기 (명령을 안 준 경우에도 안전하도록 마지막에 true)
+    { printf 'PORT=%s\n' "$PORT"; [ -n "$RUN_THIS" ] && printf 'CMD=%s\n' "$RUN_THIS"; true; } \
+      | sudo tee "${CONF_DIR}/${NAME}.env" >/dev/null
+    say "작업 공간 '${NAME}' 을(를) 백그라운드로 켭니다…"
+    sudo systemctl enable --now "$(unit "$NAME")"
+    IP="$(my_ip)"
+    say "완료! 폰/PC 에서 Tailscale 켜고 접속:  http://${IP:-<Tailscale 주소>}:${PORT}"
+    echo "   서버에서 직접 들어가려면:  tmux attach -t ${NAME}"
+    ;;
+
+  down)
+    NAME="${1:-}"; [ -n "$NAME" ] || usage
+    say "웹 창을 끄고 설정을 지웁니다…"
+    sudo systemctl disable --now "$(unit "$NAME")" 2>/dev/null || true
+    sudo rm -f "${CONF_DIR}/${NAME}.env"
+    say "작업 공간 '${NAME}' 도 정리합니다…"
+    tmux kill-session -t "$NAME" 2>/dev/null || true
+    say "정리 완료: '${NAME}' (웹 창 + 작업 공간)"
+    ;;
+
+  stop)
+    NAME="${1:-}"; [ -n "$NAME" ] || usage
+    sudo systemctl stop "$(unit "$NAME")" 2>/dev/null || true
+    say "웹 창만 닫았습니다. 작업 공간 '${NAME}' 은 그대로 있어요."
+    echo "   다시 열려면:  ttyd-tmux up ${NAME} <번호>"
+    ;;
+
+  ls|list)
+    printf '%-16s %-8s %-12s %-10s\n' "이름" "번호" "웹" "작업공간"
+    printf '%-16s %-8s %-12s %-10s\n' "----" "----" "--" "--------"
+    shopt -s nullglob
+    for f in "${CONF_DIR}"/*.env; do
+      name="$(basename "$f" .env)"
+      port="$(sed -n 's/^PORT=//p' "$f" | head -1)"
+      if systemctl is-active --quiet "$(unit "$name")"; then web="켜짐"; else web="꺼짐"; fi
+      if tmux has-session -t "$name" 2>/dev/null; then space="있음"; else space="없음"; fi
+      printf '%-16s %-8s %-12s %-10s\n' "$name" "${port:-?}" "$web" "$space"
+    done
+    ;;
+
+  url)
+    NAME="${1:-}"; [ -n "$NAME" ] || usage
+    f="${CONF_DIR}/${NAME}.env"
+    [ -f "$f" ] || { oops "'${NAME}' 설정이 없습니다. 먼저:  ttyd-tmux up ${NAME} <번호>"; exit 1; }
+    port="$(sed -n 's/^PORT=//p' "$f" | head -1)"
+    echo "http://$(my_ip):${port}"
+    ;;
+
+  run)  # 이 화면에서 바로 실행(테스트용). 화면을 붙잡고 있게 됩니다.
+    NAME="${1:-}"; PORT="${2:-}"; [ -n "$NAME" ] && [ -n "$PORT" ] || usage
+    is_number "$PORT"; shift 2 || true; RUN_THIS="$*"
+    TMUX_BIN="$(command -v tmux)"; TTYD_BIN="$(command -v ttyd)"
+    if ! "$TMUX_BIN" has-session -t "$NAME" 2>/dev/null; then
+      if [ -n "$RUN_THIS" ]; then "$TMUX_BIN" new-session -d -s "$NAME" "$RUN_THIS"
+      else "$TMUX_BIN" new-session -d -s "$NAME"; fi
+    fi
+    say "이 화면에서 웹 창을 엽니다. 이 명령은 화면을 붙잡고 계속 떠 있는 게 정상입니다."
+    echo "   · Ctrl-C 를 누르면 이 웹 창만 닫히고, 작업 공간 '${NAME}' 은 그대로 남습니다."
+    echo "   · 화면을 붙잡지 않고 항상 켜두려면:  ttyd-tmux up ${NAME} ${PORT}"
+    AUTH=(); [ -n "${TTYD_TMUX_AUTH:-}" ] && AUTH=(-c "${TTYD_TMUX_AUTH}")
+    exec "$TTYD_BIN" -i "$NET_NAME" -p "$PORT" -W "${AUTH[@]}" "$TMUX_BIN" attach -t "$NAME"
+    ;;
+
+  ""|-h|--help|help) usage 0 ;;
+  *) oops "모르는 명령입니다: $action"; usage ;;
+esac
