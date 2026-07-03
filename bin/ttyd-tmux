@@ -19,8 +19,38 @@ unit() { echo "ttyd-tmux@$1.service"; }
 
 oops() { printf '\033[1;31m✖ %s\033[0m\n' "$*" >&2; }
 say()  { printf '\033[1;36m▶ %s\033[0m\n' "$*"; }
-is_number() { case "$1" in ''|*[!0-9]*) oops "번호(포트)는 숫자여야 합니다: $1"; exit 1;; esac; }
+is_number() {
+  case "$1" in ''|*[!0-9]*) oops "번호(포트)는 숫자여야 합니다: $1"; exit 1;; esac
+  if [ "$1" -lt 1 ] || [ "$1" -gt 65535 ]; then oops "번호(포트)는 1~65535 사이여야 합니다: $1"; exit 1; fi
+}
 my_ip() { tailscale ip -4 2>/dev/null | head -1; }
+
+# 이름이 이미 등록돼 있으면 막기 (중복 방지)
+name_free_or_die() {
+  if [ -f "${CONF_DIR}/$1.env" ]; then
+    oops "'$1' 은(는) 이미 있습니다. 바꾸려면 먼저 정리하세요:  ttyd-tmux down $1"
+    exit 1
+  fi
+}
+# 포트가 (1) 다른 작업 공간이 쓰거나 (2) 시스템에서 이미 열려 있으면 막기
+port_free_or_die() {   # $1=자기이름(제외) $2=포트
+  local self="$1" port="$2" f b
+  if [ -d "$CONF_DIR" ]; then
+    for f in "$CONF_DIR"/*.env; do
+      [ -e "$f" ] || continue                     # 파일이 없으면(빈 디렉터리) 건너뜀
+      b="$(basename "$f" .env)"
+      [ "$b" = "$self" ] && continue              # 자기 자신은 제외
+      if grep -qx "PORT=${port}" "$f" 2>/dev/null; then
+        oops "번호(포트) ${port} 는 이미 작업 공간 '${b}' 이(가) 쓰고 있어요. 다른 번호를 쓰세요."
+        exit 1
+      fi
+    done
+  fi
+  if ss -ltn 2>/dev/null | grep -qE "[:.]${port}([^0-9]|$)"; then
+    oops "번호(포트) ${port} 는 이미 사용 중입니다(다른 프로그램일 수 있음). 다른 번호를 쓰세요."
+    exit 1
+  fi
+}
 
 usage() {
   cat <<'HELP'
@@ -53,6 +83,8 @@ case "$action" in
   up)
     NAME="${1:-}"; PORT="${2:-}"; [ -n "$NAME" ] && [ -n "$PORT" ] || usage
     is_number "$PORT"; shift 2 || true
+    name_free_or_die "$NAME"          # 같은 이름 중복 막기
+    port_free_or_die "$NAME" "$PORT"  # 같은 포트 중복 막기
     RUN_THIS="$*"   # 작업 공간을 새로 만들 때 안에서 실행할 명령(없으면 셸)
     sudo mkdir -p "$CONF_DIR"
     # 설정 파일 쓰기 (명령을 안 준 경우에도 안전하도록 마지막에 true)
@@ -106,6 +138,7 @@ case "$action" in
   run)  # 이 화면에서 바로 실행(테스트용). 화면을 붙잡고 있게 됩니다.
     NAME="${1:-}"; PORT="${2:-}"; [ -n "$NAME" ] && [ -n "$PORT" ] || usage
     is_number "$PORT"; shift 2 || true; RUN_THIS="$*"
+    port_free_or_die "$NAME" "$PORT"  # 같은 포트 중복 막기(run 은 기존 세션 재사용 가능하므로 이름은 허용)
     TMUX_BIN="$(command -v tmux)"; TTYD_BIN="$(command -v ttyd)"
     if ! "$TMUX_BIN" has-session -t "$NAME" 2>/dev/null; then
       if [ -n "$RUN_THIS" ]; then "$TMUX_BIN" new-session -d -s "$NAME" "$RUN_THIS"
